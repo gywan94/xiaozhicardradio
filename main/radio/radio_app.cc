@@ -13,6 +13,7 @@
 #include "esp_audio_simple_dec.h"
 #include "esp_audio_simple_dec_default.h"
 #include "esp_lvgl_port.h"
+#include "esp_epd_gdey027t91.h"
 #include "esp_log.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -41,6 +42,7 @@ class RadioApp {
     std::atomic<uint64_t> downloaded_{0};
     std::atomic<bool> enabled_{false};
     std::atomic<int> volume_{25};
+    std::atomic<bool> charging_standby_{false};
     std::atomic<AtModem*> modem_{nullptr};
     std::atomic<const char*> network_message_{nullptr};
     std::atomic<bool> power_blocked_{false},shutting_down_{false},ready_{false};
@@ -53,6 +55,11 @@ class RadioApp {
     std::vector<unsigned> filtered_;
     unsigned filter_region_=0,filter_genre_=0,page_=0,page_options_count_=0;
     bool browser_used_=false;
+    lv_obj_t *power_page_=nullptr,*off_icon_=nullptr,*charge_icon_=nullptr,*charge_cap_=nullptr,*charge_fill_=nullptr;
+    lv_obj_t *power_title_=nullptr,*power_percent_=nullptr,*power_detail_=nullptr,*power_hint_=nullptr,*power_back_=nullptr;
+    bool power_page_off_=false;
+    bool clean_refresh_pending_=true;
+    TickType_t last_clean_refresh_=0;
     std::string status_text_;
     uint64_t usage_tenths_=0;
     void UpdateLabel(lv_obj_t* label,const char* text) {
@@ -137,6 +144,7 @@ class RadioApp {
             else if(action==8||action==9)self->ChangePage(action==8?-1:1);
             else if(action>=10&&action<13)self->SelectRow(action-10);
             else if(action==15)self->RequestShutdown();
+            else if(action==16)self->ClosePowerPage();
         },LV_EVENT_CLICKED,this);
         return button;
     }
@@ -212,6 +220,76 @@ class RadioApp {
         unsigned pos=page_*3+row;if(pos>=filtered_.size())return;
         station_=filtered_[pos];StationChanged();CloseBrowser();
     }
+    // All callers hold the LVGL lock. Finish both physical updates before powering down.
+    void FlushCleanPage() {
+        if(!clean_refresh_pending_)return;
+        clean_refresh_pending_=false;
+        ESP_LOGI(TAG,"E-paper clean refresh start");
+        board_.ClearDisplay(0xff);
+        panel_gdey027t91_refresh_code(0xf7);
+        lv_obj_invalidate(lv_screen_active());
+        lv_obj_invalidate(lv_layer_top());
+        lv_refr_now(nullptr);
+        last_clean_refresh_=xTaskGetTickCount();
+        ESP_LOGI(TAG,"E-paper clean refresh complete");
+    }
+    void CreatePowerPage() {
+        power_page_=Box(lv_layer_top(),0,0,176,264);lv_obj_set_style_radius(power_page_,0,0);
+        lv_obj_set_style_text_font(power_page_,&font_puhui_16_1,0);
+        lv_obj_set_style_text_color(power_page_,lv_color_black(),0);
+        auto frame=Box(power_page_,8,8,160,248,2);lv_obj_set_style_radius(frame,8,0);
+        off_icon_=Box(power_page_,52,50,72,76);lv_obj_set_style_bg_opa(off_icon_,LV_OPA_TRANSP,0);
+        auto ring=lv_arc_create(off_icon_);lv_obj_set_size(ring,64,64);lv_obj_set_pos(ring,4,10);
+        lv_arc_set_bg_angles(ring,315,225);lv_arc_set_value(ring,0);
+        lv_obj_set_style_arc_width(ring,6,LV_PART_MAIN);lv_obj_set_style_arc_color(ring,lv_color_black(),LV_PART_MAIN);
+        lv_obj_set_style_arc_opa(ring,LV_OPA_TRANSP,LV_PART_INDICATOR);lv_obj_remove_style(ring,nullptr,LV_PART_KNOB);
+        lv_obj_remove_flag(ring,LV_OBJ_FLAG_CLICKABLE);
+        auto stem=Box(off_icon_,33,0,6,38);lv_obj_set_style_radius(stem,3,0);lv_obj_set_style_bg_color(stem,lv_color_black(),0);
+        charge_icon_=Box(power_page_,42,66,86,42,3);lv_obj_set_style_radius(charge_icon_,3,0);
+        charge_fill_=Box(charge_icon_,4,4,1,28);lv_obj_set_style_bg_color(charge_fill_,lv_color_black(),0);
+        charge_cap_=Box(power_page_,128,79,6,16);lv_obj_set_style_bg_color(charge_cap_,lv_color_black(),0);
+        power_title_=Label(power_page_,"",16,132,144,24);power_percent_=Label(power_page_,"",16,162,144,24);
+        power_detail_=Label(power_page_,"",12,187,152,22);power_hint_=Label(power_page_,"",12,217,152,24);
+        for(auto label:{power_title_,power_percent_,power_detail_,power_hint_})lv_obj_set_style_text_align(label,LV_TEXT_ALIGN_CENTER,0);
+        power_back_=Button(power_page_,"返回电台",16,28,216,120,30);
+        lv_obj_add_flag(power_page_,LV_OBJ_FLAG_HIDDEN);
+    }
+    // Called with the recursive LVGL lock held.
+    void ShowPowerPage(bool off) {
+        power_page_off_=off;clean_refresh_pending_=true;
+        lv_obj_remove_flag(power_page_,LV_OBJ_FLAG_HIDDEN);lv_obj_move_foreground(power_page_);
+        if(off) {
+            lv_obj_remove_flag(off_icon_,LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(charge_icon_,LV_OBJ_FLAG_HIDDEN);lv_obj_add_flag(charge_cap_,LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(power_back_,LV_OBJ_FLAG_HIDDEN);
+            UpdateLabel(power_title_,"已关机");UpdateLabel(power_percent_,"电台已关闭");
+            UpdateLabel(power_detail_,"按一下背键开机");UpdateLabel(power_hint_,"");
+        } else {
+            lv_obj_add_flag(off_icon_,LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(charge_icon_,LV_OBJ_FLAG_HIDDEN);lv_obj_remove_flag(charge_cap_,LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(power_back_,LV_OBJ_FLAG_HIDDEN);
+            UpdateLabel(power_title_,"充电状态");UpdateLabel(power_percent_,"--%");
+            UpdateLabel(power_detail_,"正在读取电量");UpdateLabel(power_hint_,"");
+        }
+    }
+    void UpdateChargingPage(const BoardPowerStatus& power) {
+        if(power_page_off_)return;
+        const char* title=power.fault_flags?"充电异常":power.full?"已充满":power.charging?"充电中":"外接电源";
+        UpdateLabel(power_title_,title);
+        char value[40];snprintf(value,sizeof(value),"%d%%",power.percent);UpdateLabel(power_percent_,value);
+        snprintf(value,sizeof(value),"电压 %.2fV",power.millivolts/1000.0);UpdateLabel(power_detail_,value);
+        int width=power.percent*72/100;
+        if(width){lv_obj_set_width(charge_fill_,width);lv_obj_remove_flag(charge_fill_,LV_OBJ_FLAG_HIDDEN);}else lv_obj_add_flag(charge_fill_,LV_OBJ_FLAG_HIDDEN);
+        // The button remains accessible during charging; shutdown does not imply battery power was cut.
+        UpdateLabel(power_hint_,"");
+    }
+    void ClosePowerPage() {
+        if(shutting_down_.load())return;
+        charging_standby_=false;
+        lv_obj_add_flag(power_page_,LV_OBJ_FLAG_HIDDEN);CloseBrowser();
+        if(!enabled_.load())Status("已开启电台，点击播放");
+        clean_refresh_pending_=true; // The power task performs the slow refresh outside button callbacks.
+    }
     bool Ui() {
         if(!lvgl_port_lock(3000))return false;
         auto screen=Box(lv_layer_top(),0,0,176,264);
@@ -257,37 +335,46 @@ class RadioApp {
         Button(browser_,"下页",9,116,170,44,26);Button(browser_,"返回播放",5,0,200,160,28,&back_label_);
         lv_obj_add_flag(browser_,LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text_fmt(region_label_,"%s · %s",stations[0].region,stations[0].genre);
+        CreatePowerPage();
         lvgl_port_unlock();return true;
     }
     void PowerAndSignal() {
-        unsigned ticks=0,critical_samples=0,invalid_samples=0;unsigned previous_power=~0u;
+        unsigned ticks=0,critical_samples=0,invalid_samples=0;unsigned previous_power=~0u;bool last_external=false;
         while(true) {
             if(shutting_down_.load()){vTaskDelay(pdMS_TO_TICKS(200));continue;}
             if(auto message=network_message_.exchange(nullptr))Status(message);
             BoardPowerStatus power;bool valid=board_.GetPowerStatus(power);
             if(valid) {
                 invalid_samples=0;
+                if(last_external&&!power.external_power&&charging_standby_.exchange(false))RequestShutdown();
                 bool critical_fault=(power.fault_flags&0x18)!=0;
                 if(critical_fault||(!power.external_power&&power.millivolts<=3400)) {
                     power_blocked_=true;
                     if(enabled_.exchange(false)) {generation_.fetch_add(1);if(lvgl_port_lock(1000)){lv_label_set_text(play_label_,"播放");lvgl_port_unlock();}}
                     Status(critical_fault?"电源保护，请检查充电":"电量过低，请连接充电");
                 } else if(power.external_power||power.millivolts>=3550)power_blocked_=false;
-                if(!power.external_power&&power.millivolts<=3400)++critical_samples;else critical_samples=0;
+                if(!power.external_power&&power.millivolts<=3400){if(ticks%5==0)++critical_samples;}else critical_samples=0;
                 if(critical_samples>=3&&!shutting_down_.load())RequestShutdown();
-            } else if(++invalid_samples>=3) {
+            } else if(++invalid_samples>=15) {
                 power_blocked_=true;
                 if(enabled_.exchange(false)){generation_.fetch_add(1);if(lvgl_port_lock(1000)){lv_label_set_text(play_label_,"播放");lvgl_port_unlock();}}
                 Status("电量读取异常，已停止播放");
             }
             unsigned power_code=(valid?1u:0u)|(power.external_power?2u:0u)|(power.charging?4u:0u)|(power.full?8u:0u)|(power.fault_flags<<4);
-            if(ticks%6==0||power_code!=previous_power) {
+            if(ticks%30==0||power_code!=previous_power) {
                 ESP_LOGI(TAG,"Power valid=%d SOC=%d mv=%d ma=%d external=%d charging=%d full=%d fault=0x%x FCC=%d estimated=%d",valid,power.percent,power.millivolts,power.milliamps,power.external_power,power.charging,power.full,power.fault_flags,power.full_capacity_mah,power.estimated);
                 previous_power=power_code;
             }
             if(lvgl_port_lock(1000)) {
                 if(valid) {
-                    char battery_text[20];snprintf(battery_text,sizeof(battery_text),"%s%d%%",power.estimated?"~":"",power.percent);
+                    if(power.external_power&&!last_external&&!shutting_down_.load())ShowPowerPage(false);
+                    if(!power.external_power&&last_external&&!shutting_down_.load()){lv_obj_add_flag(power_page_,LV_OBJ_FLAG_HIDDEN);clean_refresh_pending_=true;}
+                    if(power.external_power) {
+                        UpdateChargingPage(power);
+                        if(!power_page_off_&&!lv_obj_has_flag(power_page_,LV_OBJ_FLAG_HIDDEN)&&
+                            xTaskGetTickCount()-last_clean_refresh_>=pdMS_TO_TICKS(60000))clean_refresh_pending_=true;
+                    }
+                    char battery_text[20];snprintf(battery_text,sizeof(battery_text),"%d%%",power.percent);
                     UpdateLabel(battery_label_,battery_text);
                     int width=power.percent*16/100;
                     if(width>0){lv_obj_set_width(battery_fill_,width);lv_obj_remove_flag(battery_fill_,LV_OBJ_FLAG_HIDDEN);}else lv_obj_add_flag(battery_fill_,LV_OBJ_FLAG_HIDDEN);
@@ -296,9 +383,11 @@ class RadioApp {
                     char power_text[80];snprintf(power_text,sizeof(power_text),"%s",state);
                     UpdateLabel(power_label_,power_text);
                 } else {UpdateLabel(battery_label_,"--%");UpdateLabel(power_label_,"电量异常");lv_obj_add_flag(battery_fill_,LV_OBJ_FLAG_HIDDEN);lv_obj_add_flag(charge_sign_,LV_OBJ_FLAG_HIDDEN);}
+                FlushCleanPage();
                 lvgl_port_unlock();
             }
-            ++ticks;vTaskDelay(pdMS_TO_TICKS(5000));
+            if(valid)last_external=power.external_power;
+            ++ticks;vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
     void SignalMonitor() {
@@ -513,11 +602,19 @@ public:
     void ShowPoweredOff() {
         shutting_down_=true;
         if(lvgl_port_lock(3000)) {
-            CloseBrowser();lv_label_set_text(station_label_,"已停止运行");lv_label_set_text(status_label_,"长按背键开机");
-            lv_label_set_text(network_label_,"关机");lv_label_set_text(power_label_,"长按开机");
-            for(auto bar:signal_bars_)lv_obj_set_style_bg_color(bar,lv_color_white(),0);
-            lv_obj_invalidate(lv_layer_top());lv_refr_now(nullptr);lvgl_port_unlock();
+            ShowPowerPage(true);FlushCleanPage();lvgl_port_unlock();
         }
+    }
+    void ChargingStandby() {
+        charging_standby_=true;shutting_down_=false;
+        if(lvgl_port_lock(3000)){ShowPowerPage(false);lvgl_port_unlock();}
+        Status("充电待机，单击背键返回电台");
+    }
+    void TogglePower() {
+        if(shutting_down_.load())return;
+        if(charging_standby_.load()) {
+            if(lvgl_port_lock(1000)){ClosePowerPage();lvgl_port_unlock();}
+        } else RequestShutdown();
     }
     void ToggleFromButton() {
         if(lvgl_port_lock(1000)) { if(play_label_&&status_label_)Toggle();lvgl_port_unlock(); }
@@ -556,3 +653,6 @@ void RequestRadioShutdown() { auto app=active_radio.load();if(app)app->RequestSh
 void ShowRadioPoweredOff() { auto app=active_radio.load();if(app)app->ShowPoweredOff(); }
 
 void CancelRadioShutdown(const char* message) {auto app=active_radio.load();if(app)app->CancelShutdown(message);}
+
+void ToggleRadioPower(){auto app=active_radio.load();if(app)app->TogglePower();}
+void ShowRadioChargingStandby(){auto app=active_radio.load();if(app)app->ChargingStandby();}

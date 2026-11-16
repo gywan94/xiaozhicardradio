@@ -70,7 +70,7 @@ esp_err_t esp_lcd_new_panel_gdey027t91(const esp_lcd_panel_io_handle_t io,
     gdey027t91->reset_gpio_num   = panel_dev_config->reset_gpio_num;
     gdey027t91->reset_level      = panel_dev_config->flags.reset_active_high;
     gdey027t91->busy_gpio_num    = GPIO_NUM_48;  // EINK_EPD_PIN_BUSY; // panel_dev_config->busy_gpio_num;
-    gdey027t91->busy_timeout_ms  = 3000;         //
+    gdey027t91->busy_timeout_ms  = 5000;         //
     gdey027t91->base.del         = panel_gdey027t91_del;
     gdey027t91->base.reset       = panel_gdey027t91_reset;
     gdey027t91->base.init        = panel_gdey027t91_init;
@@ -297,5 +297,7 @@ static esp_err_t gdey027t91_trigger_refresh(gdey027t91_panel_t *panel, uint8_t m
 {
     esp_lcd_panel_io_tx_param(panel->io, 0x22, &mode, 1);
     esp_lcd_panel_io_tx_param(panel->io, 0x20, NULL, 0);
+    // BUSY may assert shortly after activation; do not return before the waveform starts.
+    vTaskDelay(pdMS_TO_TICKS(20));
     return gdey027t91_wait_busy(panel);
 }

@@ -9,6 +9,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <mutex>
+#include <memory>
+#include <esp_system.h>
 
 #include "esp_app_desc.h"
 #include <driver/i2c_master.h>
@@ -136,6 +139,8 @@ private:
     void InitializeI2c();            // I2C (AW32001，BQ27220，触摸屏)
     void InitializeSpi();            // SPI (显示屏，SD 卡)
     bool charger_ready_ = false;
+    MovingAverageFilter battery_filter_{60};
+    std::mutex power_sample_mutex_;
     void InitializeCharger();        // 充电 AW32001
     void InitializeGuage();          // 电量 BQ27220
     void InitializeStorage();        // 存储 
@@ -223,7 +228,7 @@ void XiaozhiCardBoard::InitializeCharger()
 
     charger_ = new Aw32001(i2c_bus_, I2C_ADDR_AW32001);
     // A failed configuration is retried on the next boot; never use an unverified setting.
-    bool ok = charger_->SetWatchdog(0, false) && charger_->SetIntWakeupTime(0) &&
+    bool ok = charger_->SetWatchdog(0, false) && charger_->SetIntWakeupTime(1) &&
         charger_->SetShippingMode(false) && charger_->SetNtcFunction(false) &&
         charger_->SetDischargeCurrent(2800) && charger_->SetChargeCurrent(260) &&
         charger_->SetChargeVoltage(4200) && charger_->SetPreChargeCurrent(31) &&
@@ -373,10 +378,14 @@ void XiaozhiCardBoard::InitializeDisplay()
 
 void XiaozhiCardBoard::InitializeButtons()
 {
-    user_button_.OnClick([]() { ToggleRadioPlayback(); });
-
-    user_button_.OnDoubleClick([]() { RequestRadioShutdown(); });
-    user_button_.OnLongPress([]() { RequestRadioShutdown(); });
+    // Ignore the press that woke the PMIC, including a release after a long hold.
+    auto ignore_release = std::make_shared<bool>(gpio_get_level(USER_BUTTON_GPIO)==0);
+    const TickType_t accept_after=xTaskGetTickCount()+pdMS_TO_TICKS(1000);
+    user_button_.OnPressUp([ignore_release,accept_after]() {
+        if(*ignore_release){*ignore_release=false;return;}
+        if(int32_t(xTaskGetTickCount()-accept_after)<0)return;
+        ToggleRadioPower();
+    });
 }
 
 void XiaozhiCardBoard::InitializeIndicator()
@@ -493,15 +502,9 @@ void XiaozhiCardBoard::Shutdown()
     if (power_status & 0x02) {
         ESP_LOGI(TAG, "底座供电中保持开机");
 
-        CancelRadioShutdown("底座供电，已停止播放");
+        ShowRadioChargingStandby();
         return;
     }
-
-    lvgl_port_lock(0);  
-    ClearDisplay(0x00);
-    lv_screen_load(display_->scr_shutdown_);
-    lv_refr_now(NULL);   
-    lvgl_port_unlock();  
 
     esp_task_wdt_delete(event_task_handle_);
 
@@ -530,6 +533,8 @@ void XiaozhiCardBoard::Shutdown()
         }
     }
   
+    // A newly attached dock must not leave a powered device showing a shutdown page.
+    if(charger_->ReadStatus(power_status,faults) && (power_status&0x02)){esp_restart();return;}
     ShowRadioPoweredOff();
     vTaskDelay(pdMS_TO_TICKS(1500));
     for (int attempt=0;attempt<3;++attempt) {
@@ -880,91 +885,15 @@ Display *XiaozhiCardBoard::GetDisplay()
     return display_;
 }
 
-bool XiaozhiCardBoard::GetBatteryLevel(int &level, bool &charging, bool &discharging)
-{
-    static uint8_t countdown = 10;
-    static char text_tip[64];
-    static float bat_vol;
-    static lv_obj_t *scr = nullptr;
-    static bool last_charging = false;
-    static MovingAverageFilter bat_filter(60); // 60 点滑动平均
-    float raw_level;
-    static int last_level = 0;
-
-    /* 读取电池电压 */
-    bat_vol = guage_->getVolt(VOLT_MODE::VOLT) / 1000.0f;
-    if (bat_vol >= BAT_VOL_FULL) {
-        raw_level = 100;
-    } else {
-        raw_level = (bat_vol - BAT_VOL_EMPTY) / (BAT_VOL_FULL - BAT_VOL_EMPTY) * 100;
-        if (raw_level < 0) {
-            raw_level = 0;
-        } 
-    }
-
-    float filtered_level = bat_filter.update(raw_level);
-    level = static_cast<int>(filtered_level + 0.5f); // 平均值取整
-    if (last_level != level) { // 状态变化时才更新显示 
-        last_level = level;
-        lvgl_port_lock(0);
-        lv_label_set_text_fmt(display_->setup_label_battery_, "%d", level);
-        lvgl_port_unlock();
-    }
-
-    charging = (charger_->GetChargeState() != 0);
-    discharging = !charging;
-    if (!power_save_timer_user_set_ && power_save_timer_ != nullptr) { // 用户未手动设置情况下 
-        if (last_charging != charging) { // 状态变化时才更新显示 
-            last_charging = charging;
-            SetPowerSaveMode(!charging); // 充电时关闭省电模式，未充电开启省电模式
-            lvgl_port_lock(0);
-            if (GetPowerSaveMode()) {
-                lv_label_set_text(display_->setup_label_auto_sleep_, "关闭自动休眠");
-            } else {
-                lv_label_set_text(display_->setup_label_auto_sleep_, "开启自动休眠");
-            }
-            lvgl_port_unlock();
-        }
-    }
-
-    if (charging) {
-        auto &app = Application::GetInstance();
-        if (app.GetDeviceState() != kDeviceStateListening) {
-            SetIndicator(0, 0, 50);
-        }
-        if (countdown < 10) {
-            if (scr) {
-                lv_screen_load(scr);
-            }
-        }
-        countdown = 10;
-    } else {
-        if (bat_vol <= BAT_VOL_EMPTY) { 
-            if (countdown < 10) {
-                snprintf(text_tip, sizeof(text_tip), "电量低 %d 秒后将关机", countdown);
-                lvgl_port_lock(0);
-                lv_label_set_text(display_->scr_tip_label_title_, "电量低，请充电！");
-                lv_label_set_text(display_->scr_tip_label_, text_tip);
-                if (countdown == 5) {
-                    scr = lv_screen_active();
-                    lv_label_set_text(display_->scr_tip_label_title_, "电量低，请充电！");
-                    lv_label_set_text(display_->scr_tip_label_, text_tip);
-                    lv_screen_load(display_->scr_tip_);
-                }
-                lvgl_port_unlock();
-            }
-            ESP_LOGI(TAG, "%s", text_tip);
-            if (--countdown <= 0) {
-                ESP_LOGI(TAG, "低电量关机");
-                PostEvent(BoardEvent::Shutdown);
-            }
-        } 
-    }
-
+bool XiaozhiCardBoard::GetBatteryLevel(int& level,bool& charging,bool& discharging) {
+    BoardPowerStatus status;
+    if(!GetPowerStatus(status))return false;
+    level=status.percent;charging=status.charging;discharging=!status.external_power;
     return true;
 }
 
 bool XiaozhiCardBoard::GetPowerStatus(BoardPowerStatus& status) {
+    std::lock_guard<std::mutex> lock(power_sample_mutex_);
     uint16_t mv = 0, soc = 0, full_capacity = 0;
     int16_t ma = 0;
     uint8_t charger_status = 0, faults = 0;
@@ -981,9 +910,12 @@ bool XiaozhiCardBoard::GetPowerStatus(BoardPowerStatus& status) {
     status.thermal_regulation = (charger_status & 1) != 0;
     status.input_limited = (charger_status & 0x04) != 0;
     status.fault_flags = (faults & 0x3f) | (charger_status & 0x80);
-    status.estimated = full_capacity < 180 || full_capacity > 450 || soc > 100 || (soc == 0 && mv >= 3600) || (soc == 100 && mv <= 3500);
-    status.percent = !status.estimated ? int(soc) : std::max(0, std::min(100, (int(mv) - 3400) * 100 / 800));
-    if (status.full) { status.percent = 100; status.estimated = false; }
+    // Match the supplied XiaozhiCard firmware: voltage scale, 60-sample average, rounding.
+    const float volts=mv/1000.0f;
+    float raw=volts>=BAT_VOL_FULL?100.0f:(volts-BAT_VOL_EMPTY)/(BAT_VOL_FULL-BAT_VOL_EMPTY)*100.0f;
+    raw=std::max(0.0f,std::min(100.0f,raw));
+    status.percent=std::max(0,std::min(100,int(battery_filter_.update(raw)+0.5f)));
+    status.estimated=true; // The official algorithm remains voltage-derived; UI omits the tilde as requested.
     SetIndicator(0, 0, status.charging ? 35 : 0);
     return true;
 }

@@ -34,7 +34,7 @@ bool Aw32001::SetCharge(bool en){return UpdateReg(0x01,0x0f,en?0x07:0x0f);}
 bool Aw32001::SetChargeCurrent(uint16_t ma){if(ma>456)ma=456;return UpdateReg(0x02,0x3f,ma/8);}
 bool Aw32001::SetDischargeCurrent(uint16_t ma){if(ma<200)ma=200;if(ma>3200)ma=3200;return UpdateReg(0x03,0xf0,(ma/200-1)<<4);}
 bool Aw32001::SetChargeVoltage(uint16_t mv){if(mv<3600)mv=3600;if(mv>4545)mv=4545;return UpdateReg(0x04,0xfc,((mv-3600)/15)<<2);}
-bool Aw32001::SetPreChargeCurrent(uint16_t ma){if(ma<1)ma=1;if(ma>31)ma=31;return UpdateReg(0x0b,0x3f,0x20|((ma/2)<<1));}
+bool Aw32001::SetPreChargeCurrent(uint16_t ma){if(ma<1)ma=1;if(ma>31)ma=31;return UpdateReg(0x0b,0x3f,0x21|((ma/2)<<1));}
 bool Aw32001::SetPrechargeToFastchargeThreshold(uint8_t sel){return sel<=1&&UpdateReg(0x04,0x03,sel?2:0);}
 bool Aw32001::SetNtcFunction(bool en){return UpdateReg(0x06,0x80,en?0x80:0);}
 bool Aw32001::SetShippingMode(bool en){
